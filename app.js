@@ -1,10 +1,11 @@
-// GOAT Meet — serverless P2P meetings (Trystero / WebRTC)
+// GOAT Meet — serverless P2P meetings (Trystero / WebRTC), build v1.2
 // Media flows directly browser-to-browser (DTLS-SRTP encrypted).
-// Public Nostr relays are used only to introduce peers to each other.
-const TRYSTERO_CDN = './trystero.bundle.mjs' // vendored Trystero 0.26.0 — no CDN dependency
+// TWO independent discovery networks run in parallel (Nostr relays +
+// WebTorrent trackers); whichever connects first wins, duplicates are merged
+// by a per-tab identity so nobody appears twice.
+const BUILD = 'v1.2'
+const ENGINE_URL = './trystero.bundle.mjs?v=12'
 const APP_ID = 'goat-meet-yeamin-v1'
-// Major, long-lived Nostr relays on wss/443 (pinned explicitly — the library's
-// seeded default list includes small hobby relays that are often dead)
 const RELAYS = [
   'wss://relay.damus.io',
   'wss://nos.lol',
@@ -15,7 +16,6 @@ const RELAYS = [
   'wss://offchain.pub',
   'wss://relay.nostr.bg'
 ]
-let relayOpen = 0
 const ICE = {
   iceServers: [
     {urls: 'stun:stun.l.google.com:19302'},
@@ -38,12 +38,19 @@ const els = {
   btnMic: $('#btn-mic'), btnCam: $('#btn-cam'), btnShare: $('#btn-share')
 }
 
-let myName = '', roomName = '', room = null
-let actions = {}
-let localStream = null, screenStream = null, screenOwner = null // peerId or 'self'
-let micOn = true, camOn = true
-let unread = 0
-const peers = new Map() // peerId -> {name, mic, cam, tile, video, avatar, micIcon, analysers}
+let myName = '', roomName = ''
+let myId = ''
+try {
+  myId = sessionStorage.getItem('gm-id') || ''
+  if (!myId) { myId = Math.random().toString(36).slice(2, 8) + Date.now().toString(36).slice(-4); sessionStorage.setItem('gm-id', myId) }
+} catch (_) { myId = 'x' + Math.random().toString(36).slice(2, 10) }
+
+const transports = []               // {label, room, chat, react, state}
+const idents = new Map()            // identity -> peer record
+const tpeerIdent = new Map()        // "label:peerId" -> identity
+const seen = new Set()              // chat/reaction dedupe ids
+let localStream = null, screenStream = null, screenOwnerId = null
+let micOn = true, camOn = true, unread = 0, relayOpen = 0, msgSeq = 0
 let audioCtx = null
 
 /* ---------------- helpers ---------------- */
@@ -60,12 +67,10 @@ function randomRoom() {
   const a = ['swift', 'quiet', 'amber', 'rapid', 'cosmic', 'velvet', 'golden', 'silent', 'brave', 'lunar']
   const b = ['falcon', 'river', 'summit', 'harbor', 'willow', 'cinder', 'meadow', 'orbit', 'cedar', 'comet']
   const pick = x => x[Math.floor(Math.random() * x.length)]
-  const num = Math.floor(1000 + Math.random() * 9000)
-  return `${pick(a)}-${pick(b)}-${num}`
+  return `${pick(a)}-${pick(b)}-${Math.floor(1000 + Math.random() * 9000)}`
 }
 function initials(name) { return (name || '?').trim().slice(0, 2).toUpperCase() }
 function callUrl() { return `${location.origin}${location.pathname}?room=${encodeURIComponent(roomName)}` }
-
 function sysChat(text) {
   const d = document.createElement('div')
   d.className = 'msg sys'; d.textContent = text
@@ -81,12 +86,19 @@ function addChat(name, text, mine = false) {
     unread++; els.chatBadge.textContent = unread; els.chatBadge.classList.remove('hidden')
   }
 }
-function floater(emoji, xPct) {
+function floater(emoji) {
   const s = document.createElement('span')
   s.className = 'floater'; s.textContent = emoji
-  s.style.left = (xPct ?? 15 + Math.random() * 70) + '%'
+  s.style.left = (15 + Math.random() * 70) + '%'
   els.floaters.appendChild(s)
   setTimeout(() => s.remove(), 2700)
+}
+function dedupe(id) {
+  if (!id) return false
+  if (seen.has(id)) return true
+  seen.add(id)
+  if (seen.size > 400) { const it = seen.values(); for (let i = 0; i < 100; i++) seen.delete(it.next().value) }
+  return false
 }
 
 /* ---------------- lobby / preview ---------------- */
@@ -121,25 +133,41 @@ $('#join-btn').addEventListener('click', join)
 els.room.addEventListener('keydown', e => { if (e.key === 'Enter') join() })
 els.name.addEventListener('keydown', e => { if (e.key === 'Enter') join() })
 
-/* ---------------- tiles ---------------- */
-function makeTile(id, label, isSelf = false) {
+/* ---------------- peer records / tiles ---------------- */
+function makeTile(label) {
   const tile = document.createElement('div')
-  tile.className = 'tile' + (isSelf ? ' self' : '')
+  tile.className = 'tile'
   const avatar = document.createElement('div'); avatar.className = 'avatar'; avatar.textContent = initials(label)
-  const video = document.createElement('video'); video.autoplay = true; video.playsInline = true; if (isSelf) video.muted = true
+  const video = document.createElement('video'); video.autoplay = true; video.playsInline = true
   const lab = document.createElement('div'); lab.className = 'tile-label'; lab.textContent = label
   const mic = document.createElement('div'); mic.className = 'tile-mic hidden'; mic.textContent = '🔇'
   tile.append(avatar, video, lab, mic)
   els.grid.appendChild(tile)
   return {tile, video, avatar, lab, mic}
 }
-function updateCount() {
-  const n = peers.size + 1
-  els.conn.textContent = `${n} in call · peer-to-peer · encrypted`
+function identFor(id, nameHint) {
+  let rec = idents.get(id)
+  if (!rec) {
+    const ui = makeTile(nameHint || 'Guest')
+    rec = {id, name: nameHint || 'Guest', mic: true, cam: true, sources: new Map(), camKey: null, screenKey: null, ...ui}
+    idents.set(id, rec)
+    sysChat(`${rec.name} joined`)
+    updateCount()
+  }
+  if (nameHint && rec.name === 'Guest') { rec.name = nameHint; rec.lab.textContent = nameHint; rec.avatar.textContent = initials(nameHint) }
+  return rec
 }
-
-/* speaking indicator */
+function applyState(rec, st) {
+  if (st.name) { rec.name = st.name; rec.lab.textContent = st.name; rec.avatar.textContent = initials(st.name) }
+  if (typeof st.mic === 'boolean') { rec.mic = st.mic; rec.mic.classList.toggle('hidden', st.mic) }
+  if (typeof st.cam === 'boolean') { rec.cam = st.cam; rec.video.style.visibility = st.cam ? '' : 'hidden' }
+}
+function updateCount() {
+  els.conn.textContent = `${idents.size + 1} in call · peer-to-peer · encrypted`
+}
 function watchSpeaking(stream, tileEl) {
+  if (stream._watched) return
+  stream._watched = true
   try {
     if (!audioCtx) audioCtx = new (window.AudioContext || window.webkitAudioContext)()
     const track = stream.getAudioTracks()[0]; if (!track) return
@@ -150,17 +178,48 @@ function watchSpeaking(stream, tileEl) {
     const iv = setInterval(() => {
       if (!tileEl.isConnected) { clearInterval(iv); return }
       an.getByteFrequencyData(data)
-      const avg = data.reduce((a, b) => a + b, 0) / data.length
+      const avg = data.reduce((x, y) => x + y, 0) / data.length
       tileEl.classList.toggle('speaking', avg > 18)
     }, 220)
-  } catch (_) { /* analyser optional */ }
+  } catch (_) {}
+}
+function showScreen(rec, stream) {
+  screenOwnerId = rec.id
+  els.spotlightVideo.srcObject = stream
+  els.spotlightLabel.textContent = `🖥️ ${rec.name} is sharing`
+  els.spotlight.classList.remove('hidden')
+}
+function hideSpotlight() {
+  screenOwnerId = null
+  els.spotlightVideo.srcObject = null
+  els.spotlight.classList.add('hidden')
+}
+function removeSource(rec, key) {
+  const src = rec.sources.get(key)
+  rec.sources.delete(key)
+  if (!src) return
+  if (rec.camKey === key) {
+    rec.camKey = null
+    const next = [...rec.sources.entries()].find(([, s]) => s.cam)
+    if (next) { rec.camKey = next[0]; rec.video.srcObject = next[1].cam; watchSpeaking(next[1].cam, rec.tile) }
+    else rec.video.srcObject = null
+  }
+  if (rec.screenKey === key) {
+    rec.screenKey = null
+    if (screenOwnerId === rec.id) {
+      const next = [...rec.sources.entries()].find(([, s]) => s.screen)
+      if (next) { rec.screenKey = next[0]; showScreen(rec, next[1].screen) } else hideSpotlight()
+    }
+  }
 }
 
-/* tune outgoing video for mesh (5-person friendly bitrate) */
-function tuneSenders(peerId) {
+/* ---------------- transport wiring ---------------- */
+function meta(kind) { return {kind, id: myId, name: myName} }
+function sendAll(action, payload) { transports.forEach(t => { try { t[action]?.send(payload) } catch (_) {} }) }
+function tuneSenders(t, peerId) {
   setTimeout(() => {
     try {
-      const pc = room?.getPeers?.()[peerId]; if (!pc) return
+      const pc = t.room.getPeers?.()[peerId]; if (!pc) return
       pc.getSenders().forEach(s => {
         if (s.track?.kind !== 'video' || !s.getParameters) return
         const p = s.getParameters()
@@ -170,17 +229,61 @@ function tuneSenders(peerId) {
     } catch (_) {}
   }, 2500)
 }
+function wireTransport(t) {
+  const key = pid => `${t.label}:${pid}`
 
-/* ---------------- state sync ---------------- */
-function broadcastState(target) {
-  actions.state?.send({name: myName, mic: micOn, cam: camOn}, target ? {target} : undefined)
-}
-function applyPeerState(id, st) {
-  const p = peers.get(id); if (!p) return
-  Object.assign(p, st)
-  if (st.name) { p.lab.textContent = st.name; p.avatar.textContent = initials(st.name) }
-  p.mic.classList.toggle('hidden', st.mic !== false)
-  if (st.cam === false) { p.video.style.visibility = 'hidden' } else { p.video.style.visibility = '' }
+  t.chat.onMessage = (data) => { if (!dedupe(data.mid)) addChat(data.name || 'Guest', data.text) }
+  t.react.onMessage = (data) => {
+    if (dedupe(data.rid)) return
+    floater(data.emoji)
+    toast(`${data.name || 'Someone'} reacted ${data.emoji}`, 1600)
+  }
+  t.state.onMessage = (data, {peerId}) => {
+    if (!data.id || data.id === myId) return
+    tpeerIdent.set(key(peerId), data.id)
+    const rec = identFor(data.id, data.name)
+    applyState(rec, data)
+  }
+
+  t.room.onPeerJoin = peerId => {
+    try { t.state?.send({id: myId, name: myName, mic: micOn, cam: camOn}, {target: peerId}) } catch (_) {}
+    if (localStream) t.room.addStream(localStream, {target: peerId, metadata: meta('cam')})
+    if (screenStream) t.room.addStream(screenStream, {target: peerId, metadata: meta('screen')})
+    tuneSenders(t, peerId)
+  }
+
+  t.room.onPeerStream = (stream, peerId, metadata) => {
+    const id = metadata?.id
+    if (!id || id === myId) return
+    tpeerIdent.set(key(peerId), id)
+    const rec = identFor(id, metadata.name)
+    let src = rec.sources.get(key(peerId))
+    if (!src) { src = {}; rec.sources.set(key(peerId), src) }
+    if ((metadata.kind || 'cam') === 'screen') {
+      src.screen = stream
+      if (!rec.screenKey || screenOwnerId === id) { rec.screenKey = key(peerId); showScreen(rec, stream) }
+      stream.getVideoTracks()[0]?.addEventListener('ended', () => removeSource(rec, key(peerId)))
+    } else {
+      src.cam = stream
+      if (!rec.camKey) { rec.camKey = key(peerId); rec.video.srcObject = stream; watchSpeaking(stream, rec.tile) }
+    }
+  }
+
+  t.room.onPeerLeave = peerId => {
+    const id = tpeerIdent.get(key(peerId))
+    tpeerIdent.delete(key(peerId))
+    if (!id) return
+    const rec = idents.get(id); if (!rec) return
+    removeSource(rec, key(peerId))
+    const stillConnected = [...tpeerIdent.values()].includes(id)
+    if (!stillConnected && rec.sources.size === 0) {
+      sysChat(`${rec.name} left`)
+      rec.tile.remove()
+      if (screenOwnerId === id) hideSpotlight()
+      idents.delete(id)
+      updateCount()
+    }
+  }
 }
 
 /* ---------------- join ---------------- */
@@ -193,96 +296,51 @@ async function join() {
   els.lobby.classList.add('hidden')
   els.call.classList.remove('hidden')
   els.roomLabel.textContent = 'Room: ' + roomName
-  els.conn.textContent = 'connecting via relays…'
+  els.conn.textContent = 'connecting…'
   history.replaceState(null, '', '?room=' + encodeURIComponent(roomName))
 
   // my own tile
-  const mine = makeTile('self', myName + ' (you)', true)
+  const mine = makeTile(myName + ' (you)')
+  mine.tile.classList.add('self')
   if (localStream) { mine.video.srcObject = localStream; watchSpeaking(localStream, mine.tile) }
   mine.mic.classList.toggle('hidden', micOn)
   syncCallButtons()
 
-  let trystero
+  let engine
   try {
-    trystero = await import(/* @vite-ignore */TRYSTERO_CDN)
+    engine = await import(/* @vite-ignore */ENGINE_URL)
   } catch (e) {
-    els.conn.textContent = 'could not load the P2P engine — check your connection and refresh'
-    toast('Failed to load meeting engine', 5000)
+    els.conn.textContent = 'could not load the meeting engine — refresh and try again'
     return
   }
 
-  room = trystero.joinRoom({appId: APP_ID, rtcConfig: ICE, relayConfig: {urls: RELAYS}}, roomName)
-  // Relay diagnostics — never fail silently again
-  const relayPoll = setInterval(() => {
+  const cfgs = [
+    ['nostr', () => engine.joinRoomNostr({appId: APP_ID, rtcConfig: ICE, relayConfig: {urls: RELAYS}}, roomName)],
+    ['torrent', () => engine.joinRoomTorrent({appId: APP_ID, rtcConfig: ICE}, roomName)]
+  ]
+  for (const [label, make] of cfgs) {
     try {
-      const socks = trystero.getRelaySockets ? Object.values(trystero.getRelaySockets()) : []
+      const roomT = make()
+      const t = {label, room: roomT, chat: roomT.makeAction('chat'), react: roomT.makeAction('react'), state: roomT.makeAction('state')}
+      transports.push(t)
+      wireTransport(t)
+      if (localStream) roomT.addStream(localStream, {metadata: meta('cam')})
+    } catch (e) { console.warn(label, 'transport failed', e) }
+  }
+  if (!transports.length) { els.conn.textContent = 'no discovery network could start — refresh'; return }
+
+  setInterval(() => {
+    try {
+      const socks = engine.getRelaySockets ? Object.values(engine.getRelaySockets()) : []
       relayOpen = socks.filter(s => s.readyState === 1).length
-      if (peers.size === 0) {
-        els.conn.textContent = relayOpen > 0
-          ? `just you here — ${relayOpen}/${RELAYS.length} relays connected · share the link`
-          : 'connecting to relays… (if this stays, your network may block them — try another network)'
-      }
     } catch (_) {}
-  }, 3000)
-  setTimeout(() => { if (relayOpen === 0) toast('No signaling relays reachable from this network — meetings cannot start here. Try a different network/browser.', 7000) }, 20000)
-  actions.chat = room.makeAction('chat')
-  actions.react = room.makeAction('react')
-  actions.state = room.makeAction('state')
-
-  actions.chat.onMessage = (data, {peerId}) => addChat(data.name || peers.get(peerId)?.name || 'Guest', data.text)
-  actions.react.onMessage = (data, {peerId}) => {
-    floater(data.emoji)
-    toast(`${data.name || peers.get(peerId)?.name || 'Someone'} reacted ${data.emoji}`, 1600)
-  }
-  actions.state.onMessage = (data, {peerId}) => applyPeerState(peerId, data)
-
-  room.onPeerJoin = peerId => {
-    const p = makeTile(peerId, 'Guest')
-    peers.set(peerId, {name: 'Guest', mic: true, cam: true, ...p})
-    sysChat('Someone joined')
-    updateCount()
-    broadcastState(peerId)
-    if (localStream) room.addStream(localStream, {target: peerId, metadata: {kind: 'cam', name: myName}})
-    if (screenStream) room.addStream(screenStream, {target: peerId, metadata: {kind: 'screen', name: myName}})
-    tuneSenders(peerId)
-  }
-
-  room.onPeerLeave = peerId => {
-    const p = peers.get(peerId)
-    sysChat(`${p?.name || 'Someone'} left`)
-    p?.tile.remove()
-    if (screenOwner === peerId) hideSpotlight()
-    peers.delete(peerId)
-    updateCount()
-  }
-
-  room.onPeerStream = (stream, peerId, metadata) => {
-    const p = peers.get(peerId); if (!p) return
-    const kind = metadata?.kind || 'cam'
-    if (metadata?.name) applyPeerState(peerId, {name: metadata.name})
-    if (kind === 'screen') {
-      screenOwner = peerId
-      els.spotlightVideo.srcObject = stream
-      els.spotlightLabel.textContent = `🖥️ ${metadata?.name || p.name} is sharing`
-      els.spotlight.classList.remove('hidden')
-      stream.getVideoTracks()[0]?.addEventListener('ended', () => { if (screenOwner === peerId) hideSpotlight() })
-      stream.addEventListener('removetrack', () => { if (screenOwner === peerId) hideSpotlight() })
-    } else {
-      p.video.srcObject = stream
-      watchSpeaking(stream, p.tile)
+    if (idents.size === 0) {
+      els.conn.textContent = `waiting for others · relays ${relayOpen}/${RELAYS.length} + torrent · share the link`
     }
-  }
-
-  if (localStream) room.addStream(localStream, {metadata: {kind: 'cam', name: myName}})
-  setTimeout(() => { if (peers.size === 0 && relayOpen === 0) els.conn.textContent = 'connecting to relays…' }, 4000)
+  }, 3000)
+  setTimeout(() => { if (relayOpen === 0 && idents.size === 0) toast('Still no relays after 25s — this network may block them. Try another network if nobody can join.', 7000) }, 25000)
   updateCount()
   sysChat('You joined room "' + roomName + '"')
-}
-
-function hideSpotlight() {
-  screenOwner = null
-  els.spotlightVideo.srcObject = null
-  els.spotlight.classList.add('hidden')
 }
 
 /* ---------------- controls ---------------- */
@@ -292,6 +350,7 @@ function syncCallButtons() {
   els.btnCam.classList.toggle('off', !camOn)
   els.btnCam.innerHTML = (camOn ? '📷' : '🚫') + '<span>Camera</span>'
 }
+function broadcastState() { sendAll('state', {id: myId, name: myName, mic: micOn, cam: camOn}) }
 els.btnMic.addEventListener('click', toggleMic)
 els.btnCam.addEventListener('click', toggleCam)
 function toggleMic() {
@@ -311,23 +370,23 @@ els.btnShare.addEventListener('click', async () => {
   if (screenStream) { stopShare(); return }
   try {
     screenStream = await navigator.mediaDevices.getDisplayMedia({video: true, audio: true})
-  } catch (_) { return } // user cancelled picker
-  screenOwner = 'self'
+  } catch (_) { return }
+  screenOwnerId = myId
   els.spotlightVideo.srcObject = screenStream
   els.spotlightLabel.textContent = '🖥️ You are sharing your screen'
   els.spotlight.classList.remove('hidden')
   els.btnShare.classList.add('active')
-  room?.addStream(screenStream, {metadata: {kind: 'screen', name: myName}})
+  transports.forEach(t => t.room.addStream(screenStream, {metadata: meta('screen')}))
   screenStream.getVideoTracks()[0].addEventListener('ended', stopShare)
-  toast('Sharing screen' + (screenStream.getAudioTracks().length ? ' with audio' : '') )
+  toast('Sharing screen' + (screenStream.getAudioTracks().length ? ' with audio' : ''))
 })
 function stopShare() {
   if (!screenStream) return
-  room?.removeStream(screenStream, {metadata: {kind: 'screen', name: myName}})
+  transports.forEach(t => { try { t.room.removeStream(screenStream, {metadata: meta('screen')}) } catch (_) {} })
   screenStream.getTracks().forEach(t => t.stop())
   screenStream = null
   els.btnShare.classList.remove('active')
-  if (screenOwner === 'self') hideSpotlight()
+  if (screenOwnerId === myId) hideSpotlight()
 }
 
 $('#copy-btn').addEventListener('click', async () => {
@@ -338,7 +397,7 @@ $('#copy-btn').addEventListener('click', async () => {
 $('#btn-react').addEventListener('click', () => $('#react-menu').classList.toggle('hidden'))
 document.querySelectorAll('#react-menu button').forEach(b => b.addEventListener('click', () => {
   const emoji = b.dataset.emoji
-  actions.react?.send({emoji, name: myName})
+  sendAll('react', {rid: myId + '-' + (++msgSeq) + '-' + Date.now(), emoji, name: myName})
   floater(emoji)
   $('#react-menu').classList.add('hidden')
 }))
@@ -352,12 +411,14 @@ $('#chat-form').addEventListener('submit', e => {
   e.preventDefault()
   const text = $('#chat-input').value.trim(); if (!text) return
   $('#chat-input').value = ''
-  actions.chat?.send({name: myName, text})
+  const payload = {mid: myId + '-' + (++msgSeq) + '-' + Date.now(), name: myName, text}
+  dedupe(payload.mid)
+  sendAll('chat', payload)
   addChat(myName, text, true)
 })
 
 $('#btn-leave').addEventListener('click', () => {
-  try { room?.leave() } catch (_) {}
+  transports.forEach(t => { try { t.room.leave() } catch (_) {} })
   localStream?.getTracks().forEach(t => t.stop())
   screenStream?.getTracks().forEach(t => t.stop())
   location.href = location.pathname + '?room=' + encodeURIComponent(roomName)
@@ -372,6 +433,7 @@ document.addEventListener('keydown', e => {
 
 /* ---------------- init ---------------- */
 {
+  const tag = $('#build-tag'); if (tag) tag.textContent = 'build ' + BUILD + ' · no servers · no tracking'
   const q = new URLSearchParams(location.search)
   const roomParam = q.get('room') || (location.hash || '').replace('#', '')
   if (roomParam) els.room.value = sanitizeRoom(roomParam)
