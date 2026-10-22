@@ -1,0 +1,79 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>GOAT Meet — signaling debug</title>
+<style>body{background:#0b0e14;color:#eef2f8;font-family:monospace;padding:14px;font-size:13px;line-height:1.6}h1{font-size:17px}pre{white-space:pre-wrap;word-break:break-all;background:#151a24;padding:12px;border-radius:10px;min-height:300px}button{padding:10px 16px;font-size:15px}</style>
+</head>
+<body>
+<h1>GOAT Meet debug — build v1.2-diag</h1>
+<p>Room: <b id="room-name"></b> · Self: <b id="self-name"></b></p>
+<button id="start">Start debug join</button>
+<pre id="log">not started</pre>
+<script type="module">
+const logEl = document.getElementById('log')
+const lines = []
+function log(...a) {
+  const line = new Date().toISOString().slice(11, 19) + ' ' + a.join(' ')
+  lines.push(line); logEl.textContent = lines.join('\n')
+  console.log(line)
+}
+const roomName = 'debug-room-42'
+document.getElementById('room-name').textContent = roomName
+document.getElementById('start').addEventListener('click', async () => {
+  logEl.textContent = ''
+  const engine = await import('./trystero.bundle.mjs?v=12')
+  document.getElementById('self-name').textContent = engine.selfId
+  log('engine loaded, selfId', engine.selfId)
+  const ICE = {iceServers: [
+    {urls: 'stun:stun.l.google.com:19302'},
+    {urls: 'stun:stun.cloudflare.com:3478'},
+    {urls: 'turn:openrelay.metered.ca:80', username: 'openrelayproject', credential: 'openrelayproject'},
+    {urls: 'turn:openrelay.metered.ca:443', username: 'openrelayproject', credential: 'openrelayproject'},
+    {urls: 'turn:openrelay.metered.ca:443?transport=tcp', username: 'openrelayproject', credential: 'openrelayproject'}
+  ]}
+  const RELAYS = ['wss://relay.damus.io','wss://nos.lol','wss://relay.nostr.band','wss://relay.primal.net','wss://nostr.mom','wss://relay.snort.social','wss://offchain.pub','wss://relay.nostr.bg']
+  const transports = []
+  function wire(label, room) {
+    const ping = room.makeAction('ping')
+    let n = 0
+    setInterval(() => ping.send({n: ++n}).catch(() => {}), 5000)
+    ping.onMessage = (d, {peerId}) => log(label, 'PING received from', peerId.slice(0, 8), JSON.stringify(d))
+    room.onPeerJoin = pid => log(label, '>>> onPeerJoin', pid.slice(0, 8))
+    room.onPeerLeave = pid => log(label, '<<< onPeerLeave', pid.slice(0, 8))
+    transports.push({label, room})
+    log(label, 'room joined')
+  }
+  try { wire('nostr', engine.joinRoomNostr({appId: 'goat-meet-yeamin-v1', rtcConfig: ICE, relayConfig: {urls: RELAYS}}, roomName)) } catch (e) { log('nostr FAILED', e.message) }
+  try { wire('torrent', engine.joinRoomTorrent({appId: 'goat-meet-yeamin-v1', rtcConfig: ICE}, roomName)) } catch (e) { log('torrent FAILED', e.message) }
+  // ICE candidate probe (no peer needed): does this browser get srflx candidates?
+  try {
+    const pc = new RTCPeerConnection(ICE)
+    pc.createDataChannel('probe')
+    pc.onicecandidate = e => { if (e.candidate) log('ICE probe candidate:', e.candidate.type, e.candidate.protocol, (e.candidate.address || '').slice(0, 20)) }
+    const offer = await pc.createOffer(); await pc.setLocalDescription(offer)
+    setTimeout(() => log('ICE probe state:', pc.iceGatheringState), 6000)
+  } catch (e) { log('ICE probe failed', e.message) }
+  // poll peer connections + relay sockets
+  setInterval(() => {
+    try {
+      const socks = engine.getRelaySockets ? Object.entries(engine.getRelaySockets()).map(([u, s]) => u.replace('wss://', '') + '=' + s.readyState).join(' ') : 'n/a'
+      log('nostr sockets:', socks)
+    } catch (e) { log('socket poll err', e.message) }
+    transports.forEach(({label, room}) => {
+      try {
+        const peers = room.getPeers()
+        const ids = Object.keys(peers)
+        if (!ids.length) { log(label, 'pcs: none'); return }
+        ids.forEach(id => {
+          const pc = peers[id]
+          log(label, 'pc', id.slice(0, 8), 'conn=' + pc.connectionState, 'ice=' + pc.iceConnectionState, 'sig=' + pc.signalingState)
+        })
+      } catch (e) { log(label, 'pc poll err', e.message) }
+    })
+  }, 8000)
+})
+</script>
+</body>
+</html>
