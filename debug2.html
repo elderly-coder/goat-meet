@@ -1,0 +1,75 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>GOAT Meet — PeerJS debug</title>
+<style>body{background:#0b0e14;color:#eef2f8;font-family:monospace;padding:14px;font-size:13px;line-height:1.6}h1{font-size:17px}pre{white-space:pre-wrap;word-break:break-all;background:#151a24;padding:12px;border-radius:10px;min-height:300px}button{padding:10px 16px;font-size:15px}</style>
+</head>
+<body>
+<h1>GOAT Meet debug2 — PeerJS cloud test</h1>
+<p>Room host id: <b>goatmeet-dbg-room-7-host</b> · Role: <b id="role">?</b> · My peer id: <b id="pid">?</b></p>
+<button id="start">Start PeerJS test</button>
+<pre id="log">not started</pre>
+<script type="module">
+const logEl = document.getElementById('log')
+const lines = []
+function log(...a) {
+  const line = new Date().toISOString().slice(11, 19) + ' ' + a.join(' ')
+  lines.push(line); logEl.textContent = lines.join('\n'); console.log(line)
+}
+const HOST_ID = 'goatmeet-dbg-room-7-host'
+const ICE = {iceServers: [
+  {urls: 'stun:stun.l.google.com:19302'},
+  {urls: 'stun:stun.cloudflare.com:3478'},
+  {urls: 'turn:openrelay.metered.ca:80', username: 'openrelayproject', credential: 'openrelayproject'},
+  {urls: 'turn:openrelay.metered.ca:443', username: 'openrelayproject', credential: 'openrelayproject'},
+  {urls: 'turn:openrelay.metered.ca:443?transport=tcp', username: 'openrelayproject', credential: 'openrelayproject'}
+]}
+document.getElementById('start').addEventListener('click', async () => {
+  logEl.textContent = ''
+  const {Peer} = await import('./peerjs.bundle.mjs')
+  log('peerjs loaded')
+  let role = 'host'
+  let peer = new Peer(HOST_ID, {config: ICE, debug: 0})
+  const wireData = (conn, tag) => {
+    conn.on('open', () => { log(tag, 'DATA CONNECTION OPEN with', conn.peer); conn.send('hello from ' + tag + ' ' + peer.id) })
+    conn.on('data', d => log(tag, 'DATA RECEIVED:', JSON.stringify(d)))
+    conn.on('close', () => log(tag, 'data conn closed'))
+    conn.on('error', e => log(tag, 'data conn error', e.type || e.message || e))
+    if (conn.peerConnection) {
+      log(tag, 'ice state now', conn.peerConnection.iceConnectionState)
+      conn.peerConnection.oniceconnectionstatechange = () => log(tag, 'ice state ->', conn.peerConnection.iceConnectionState)
+    }
+  }
+  peer.on('open', id => {
+    log('peer open, id =', id)
+    document.getElementById('pid').textContent = id
+    document.getElementById('role').textContent = role
+    if (role === 'guest') {
+      log('guest: connecting data to host', HOST_ID)
+      wireData(peer.connect(HOST_ID, {reliable: true}), 'guest')
+    }
+  })
+  peer.on('connection', conn => { log('incoming data connection from', conn.peer); wireData(conn, role) })
+  peer.on('error', e => {
+    log('peer error:', e.type, e.message || '')
+    if (e.type === 'unavailable-id' && role === 'host') {
+      role = 'guest'
+      log('host id taken -> becoming guest')
+      try { peer.destroy() } catch (_) {}
+      peer = new Peer({config: ICE, debug: 0})
+      peer.on('open', id => {
+        log('guest peer open, id =', id)
+        document.getElementById('pid').textContent = id
+        document.getElementById('role').textContent = 'guest'
+        wireData(peer.connect(HOST_ID, {reliable: true}), 'guest')
+      })
+      peer.on('connection', conn => { log('incoming data connection from', conn.peer); wireData(conn, 'guest') })
+      peer.on('error', e2 => log('guest peer error:', e2.type, e2.message || ''))
+    }
+  })
+})
+</script>
+</body>
+</html>

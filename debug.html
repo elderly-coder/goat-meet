@@ -11,6 +11,15 @@
 <p>Room: <b id="room-name"></b> · Self: <b id="self-name"></b></p>
 <button id="start">Start debug join</button>
 <pre id="log">not started</pre>
+<script>
+// capture console + errors into the log before anything else runs
+window.__earlyLogs = []
+;['warn','error','log'].forEach(k => {
+  const orig = console[k].bind(console)
+  console[k] = (...a) => { window.__earlyLogs.push(k.toUpperCase() + ': ' + a.map(x => { try { return typeof x === 'string' ? x : JSON.stringify(x) } catch (_) { return String(x) } }).join(' ')); orig(...a) }
+})
+window.addEventListener('error', e => window.__earlyLogs.push('WINDOW ERROR: ' + e.message))
+</script>
 <script type="module">
 const logEl = document.getElementById('log')
 const lines = []
@@ -20,6 +29,8 @@ function log(...a) {
   console.log(line)
 }
 const roomName = 'debug-room-42'
+window.__earlyLogs.forEach(l => log('captured', l))
+setInterval(() => { window.__earlyLogs.splice(0).forEach(l => log('captured', l)) }, 4000)
 document.getElementById('room-name').textContent = roomName
 document.getElementById('start').addEventListener('click', async () => {
   logEl.textContent = ''
