@@ -3,6 +3,19 @@
 // Public Nostr relays are used only to introduce peers to each other.
 const TRYSTERO_CDN = './trystero.bundle.mjs' // vendored Trystero 0.26.0 — no CDN dependency
 const APP_ID = 'goat-meet-yeamin-v1'
+// Major, long-lived Nostr relays on wss/443 (pinned explicitly — the library's
+// seeded default list includes small hobby relays that are often dead)
+const RELAYS = [
+  'wss://relay.damus.io',
+  'wss://nos.lol',
+  'wss://relay.nostr.band',
+  'wss://relay.primal.net',
+  'wss://nostr.mom',
+  'wss://relay.snort.social',
+  'wss://offchain.pub',
+  'wss://relay.nostr.bg'
+]
+let relayOpen = 0
 const ICE = {
   iceServers: [
     {urls: 'stun:stun.l.google.com:19302'},
@@ -198,7 +211,20 @@ async function join() {
     return
   }
 
-  room = trystero.joinRoom({appId: APP_ID, rtcConfig: ICE}, roomName)
+  room = trystero.joinRoom({appId: APP_ID, rtcConfig: ICE, relayConfig: {urls: RELAYS}}, roomName)
+  // Relay diagnostics — never fail silently again
+  const relayPoll = setInterval(() => {
+    try {
+      const socks = trystero.getRelaySockets ? Object.values(trystero.getRelaySockets()) : []
+      relayOpen = socks.filter(s => s.readyState === 1).length
+      if (peers.size === 0) {
+        els.conn.textContent = relayOpen > 0
+          ? `just you here — ${relayOpen}/${RELAYS.length} relays connected · share the link`
+          : 'connecting to relays… (if this stays, your network may block them — try another network)'
+      }
+    } catch (_) {}
+  }, 3000)
+  setTimeout(() => { if (relayOpen === 0) toast('No signaling relays reachable from this network — meetings cannot start here. Try a different network/browser.', 7000) }, 20000)
   actions.chat = room.makeAction('chat')
   actions.react = room.makeAction('react')
   actions.state = room.makeAction('state')
@@ -248,7 +274,7 @@ async function join() {
   }
 
   if (localStream) room.addStream(localStream, {metadata: {kind: 'cam', name: myName}})
-  setTimeout(() => { if (peers.size === 0) els.conn.textContent = 'just you here — share the link to invite your team' }, 4000)
+  setTimeout(() => { if (peers.size === 0 && relayOpen === 0) els.conn.textContent = 'connecting to relays…' }, 4000)
   updateCount()
   sysChat('You joined room "' + roomName + '"')
 }
