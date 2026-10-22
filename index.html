@@ -1,0 +1,99 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
+<meta name="theme-color" content="#0b0e14">
+<title>GOAT Meet — private team calls</title>
+<meta name="description" content="Private peer-to-peer team meetings. No servers, no tracking, no time limits. Share a link and meet.">
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'><text y='.9em' font-size='90'>🐐</text></svg>">
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+<!-- ============ LOBBY ============ -->
+<main id="lobby" class="lobby">
+  <div class="lobby-card">
+    <div class="brand">🐐 GOAT <span>Meet</span></div>
+    <p class="tagline">Private peer-to-peer meetings. No servers storing your call, no AI listening, no time limit. Your video goes straight to your team — encrypted.</p>
+
+    <div class="preview-wrap">
+      <video id="preview" autoplay muted playsinline></video>
+      <div id="preview-off" class="preview-off hidden">Camera is off</div>
+      <div class="preview-controls">
+        <button id="pre-mic" class="ctl small" title="Toggle microphone">🎙️</button>
+        <button id="pre-cam" class="ctl small" title="Toggle camera">📷</button>
+      </div>
+    </div>
+    <p id="media-note" class="note"></p>
+
+    <label class="field">Your name
+      <input id="name-input" type="text" maxlength="30" placeholder="e.g. Yeamin" autocomplete="name">
+    </label>
+    <label class="field">Room
+      <input id="room-input" type="text" maxlength="60" placeholder="e.g. team-daily" autocomplete="off" spellcheck="false">
+    </label>
+    <div class="lobby-actions">
+      <button id="join-btn" class="primary">Join meeting</button>
+      <button id="instant-btn" class="ghost">⚡ Instant private room</button>
+    </div>
+    <p class="note">Anyone with the room link can join — use Instant for an unguessable room name. Calls are peer-to-peer for up to ~6 people.</p>
+  </div>
+</main>
+
+<!-- ============ CALL ============ -->
+<main id="call" class="call hidden">
+  <header class="topbar">
+    <div class="brand small-brand">🐐 GOAT <span>Meet</span></div>
+    <div id="room-label" class="room-label"></div>
+    <div id="conn-label" class="conn-label">connecting…</div>
+    <button id="copy-btn" class="ghost small-btn">🔗 Copy link</button>
+  </header>
+
+  <section id="stage" class="stage">
+    <div id="spotlight" class="spotlight hidden">
+      <video id="spotlight-video" autoplay playsinline></video>
+      <div id="spotlight-label" class="tile-label"></div>
+    </div>
+    <div id="grid" class="grid"></div>
+  </section>
+
+  <div id="floaters" class="floaters" aria-hidden="true"></div>
+
+  <aside id="chat" class="chat hidden">
+    <div class="chat-head">In-meeting messages
+      <button id="chat-close" class="ghost small-btn">✕</button>
+    </div>
+    <div id="chat-log" class="chat-log"></div>
+    <form id="chat-form" class="chat-form">
+      <input id="chat-input" type="text" maxlength="500" placeholder="Send a message…" autocomplete="off">
+      <button type="submit" class="primary small-btn">Send</button>
+    </form>
+    <p class="note chat-note">Messages go peer-to-peer and are never stored.</p>
+  </aside>
+
+  <footer class="controls">
+    <button id="btn-mic" class="ctl" title="Mute / unmute (m)">🎙️<span>Mic</span></button>
+    <button id="btn-cam" class="ctl" title="Camera on / off (v)">📷<span>Camera</span></button>
+    <button id="btn-share" class="ctl" title="Share your screen">🖥️<span>Share</span></button>
+    <div class="react-wrap">
+      <div id="react-menu" class="react-menu hidden">
+        <button data-emoji="👍">👍</button>
+        <button data-emoji="❤️">❤️</button>
+        <button data-emoji="😂">😂</button>
+        <button data-emoji="👏">👏</button>
+        <button data-emoji="🎉">🎉</button>
+        <button data-emoji="🔥">🔥</button>
+      </div>
+      <button id="btn-react" class="ctl" title="Send a reaction">😀<span>React</span></button>
+    </div>
+    <button id="btn-chat" class="ctl" title="Chat">💬<span>Chat</span><b id="chat-badge" class="badge hidden">0</b></button>
+    <button id="btn-leave" class="ctl danger" title="Leave the call">📞<span>Leave</span></button>
+  </footer>
+</main>
+
+<div id="toast" class="toast hidden"></div>
+
+<script type="module" src="app.js"></script>
+</body>
+</html>
