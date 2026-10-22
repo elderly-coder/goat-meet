@@ -1,21 +1,10 @@
-// GOAT Meet — serverless P2P meetings (Trystero / WebRTC), build v1.2
-// Media flows directly browser-to-browser (DTLS-SRTP encrypted).
-// TWO independent discovery networks run in parallel (Nostr relays +
-// WebTorrent trackers); whichever connects first wins, duplicates are merged
-// by a per-tab identity so nobody appears twice.
-const BUILD = 'v1.2'
-const ENGINE_URL = './trystero.bundle.mjs?v=12'
-const APP_ID = 'goat-meet-yeamin-v1'
-const RELAYS = [
-  'wss://relay.damus.io',
-  'wss://nos.lol',
-  'wss://relay.nostr.band',
-  'wss://relay.primal.net',
-  'wss://nostr.mom',
-  'wss://relay.snort.social',
-  'wss://offchain.pub',
-  'wss://relay.nostr.bg'
-]
+// GOAT Meet — serverless P2P meetings, build v1.3 (PeerJS mesh)
+// Signaling: PeerJS Cloud introduces peers (host pattern). Media and data
+// then flow directly browser-to-browser (DTLS-SRTP encrypted). No meeting
+// server ever sees the call.
+const BUILD = 'v1.3'
+const ENGINE_URL = './peerjs.bundle.mjs?v=13'
+const HOST_PREFIX = 'goatmeet-v3-'
 const ICE = {
   iceServers: [
     {urls: 'stun:stun.l.google.com:19302'},
@@ -38,19 +27,22 @@ const els = {
   btnMic: $('#btn-mic'), btnCam: $('#btn-cam'), btnShare: $('#btn-share')
 }
 
-let myName = '', roomName = ''
+let myName = '', roomName = '', hostId = ''
 let myId = ''
 try {
   myId = sessionStorage.getItem('gm-id') || ''
   if (!myId) { myId = Math.random().toString(36).slice(2, 8) + Date.now().toString(36).slice(-4); sessionStorage.setItem('gm-id', myId) }
 } catch (_) { myId = 'x' + Math.random().toString(36).slice(2, 10) }
 
-const transports = []               // {label, room, chat, react, state}
-const idents = new Map()            // identity -> peer record
-const tpeerIdent = new Map()        // "label:peerId" -> identity
-const seen = new Set()              // chat/reaction dedupe ids
-let localStream = null, screenStream = null, screenOwnerId = null
-let micOn = true, camOn = true, unread = 0, relayOpen = 0, msgSeq = 0
+let Peer = null, peer = null, amHost = false
+const members = new Map()   // peerId -> {peerId, uid, name}  (everyone except me; host keeps the master list)
+const conns = new Map()     // peerId -> DataConnection (open or opening)
+const calls = new Map()     // peerId -> MediaConnection (camera calls)
+const idents = new Map()    // uid -> tile record
+const peerUid = new Map()   // peerId -> uid
+const seen = new Set()
+let localStream = null, screenStream = null, screenOwnerId = null, screenCalls = new Map()
+let micOn = true, camOn = true, unread = 0, msgSeq = 0, joinedAt = Date.now()
 let audioCtx = null
 
 /* ---------------- helpers ---------------- */
@@ -133,24 +125,23 @@ $('#join-btn').addEventListener('click', join)
 els.room.addEventListener('keydown', e => { if (e.key === 'Enter') join() })
 els.name.addEventListener('keydown', e => { if (e.key === 'Enter') join() })
 
-/* ---------------- peer records / tiles ---------------- */
-function makeTile(label) {
+/* ---------------- tiles ---------------- */
+function makeTile(label, isSelf = false) {
   const tile = document.createElement('div')
-  tile.className = 'tile'
+  tile.className = 'tile' + (isSelf ? ' self' : '')
   const avatar = document.createElement('div'); avatar.className = 'avatar'; avatar.textContent = initials(label)
-  const video = document.createElement('video'); video.autoplay = true; video.playsInline = true
+  const video = document.createElement('video'); video.autoplay = true; video.playsInline = true; if (isSelf) video.muted = true
   const lab = document.createElement('div'); lab.className = 'tile-label'; lab.textContent = label
   const mic = document.createElement('div'); mic.className = 'tile-mic hidden'; mic.textContent = '🔇'
   tile.append(avatar, video, lab, mic)
   els.grid.appendChild(tile)
   return {tile, video, avatar, lab, mic}
 }
-function identFor(id, nameHint) {
-  let rec = idents.get(id)
+function identFor(uid, nameHint) {
+  let rec = idents.get(uid)
   if (!rec) {
-    const ui = makeTile(nameHint || 'Guest')
-    rec = {id, name: nameHint || 'Guest', mic: true, cam: true, sources: new Map(), camKey: null, screenKey: null, ...ui}
-    idents.set(id, rec)
+    rec = {uid, name: nameHint || 'Guest', mic: true, cam: true, ...makeTile(nameHint || 'Guest')}
+    idents.set(uid, rec)
     sysChat(`${rec.name} joined`)
     updateCount()
   }
@@ -183,10 +174,10 @@ function watchSpeaking(stream, tileEl) {
     }, 220)
   } catch (_) {}
 }
-function showScreen(rec, stream) {
-  screenOwnerId = rec.id
+function showScreen(uid, name, stream) {
+  screenOwnerId = uid
   els.spotlightVideo.srcObject = stream
-  els.spotlightLabel.textContent = `🖥️ ${rec.name} is sharing`
+  els.spotlightLabel.textContent = `🖥️ ${name} is sharing`
   els.spotlight.classList.remove('hidden')
 }
 function hideSpotlight() {
@@ -194,102 +185,222 @@ function hideSpotlight() {
   els.spotlightVideo.srcObject = null
   els.spotlight.classList.add('hidden')
 }
-function removeSource(rec, key) {
-  const src = rec.sources.get(key)
-  rec.sources.delete(key)
-  if (!src) return
-  if (rec.camKey === key) {
-    rec.camKey = null
-    const next = [...rec.sources.entries()].find(([, s]) => s.cam)
-    if (next) { rec.camKey = next[0]; rec.video.srcObject = next[1].cam; watchSpeaking(next[1].cam, rec.tile) }
-    else rec.video.srcObject = null
-  }
-  if (rec.screenKey === key) {
-    rec.screenKey = null
-    if (screenOwnerId === rec.id) {
-      const next = [...rec.sources.entries()].find(([, s]) => s.screen)
-      if (next) { rec.screenKey = next[0]; showScreen(rec, next[1].screen) } else hideSpotlight()
+function removeIdent(uid, nameForMsg) {
+  const rec = idents.get(uid); if (!rec) return
+  sysChat(`${nameForMsg || rec.name} left`)
+  rec.tile.remove()
+  if (screenOwnerId === uid) hideSpotlight()
+  idents.delete(uid)
+  updateCount()
+}
+
+/* ---------------- data mesh ---------------- */
+function sendTo(peerId, payload) {
+  const c = conns.get(peerId)
+  if (c?.open) { try { c.send(payload) } catch (_) {} }
+}
+function broadcast(payload, exceptPeerId) {
+  conns.forEach((c, pid) => { if (pid !== exceptPeerId && c.open) { try { c.send(payload) } catch (_) {} } })
+}
+function broadcastState() { broadcast({t: 'state', uid: myId, name: myName, mic: micOn, cam: camOn}) }
+
+function wireConn(conn) {
+  const pid = conn.peer
+  conns.set(pid, conn)
+  conn.on('open', () => {
+    conns.set(pid, conn)
+    conn.send({t: 'hi', uid: myId, name: myName})
+    conn.send({t: 'state', uid: myId, name: myName, mic: micOn, cam: camOn})
+    if (amHost) {
+      // I am host: a guest just connected to me directly.
+      // (Their 'hello' arrives as data; handled below.)
     }
-  }
+  })
+  conn.on('data', data => onData(pid, data))
+  conn.on('close', () => onPeerGone(pid))
+  conn.on('error', () => {})
 }
-
-/* ---------------- transport wiring ---------------- */
-function meta(kind) { return {kind, id: myId, name: myName} }
-function sendAll(action, payload) { transports.forEach(t => { try { t[action]?.send(payload) } catch (_) {} }) }
-function tuneSenders(t, peerId) {
-  setTimeout(() => {
-    try {
-      const pc = t.room.getPeers?.()[peerId]; if (!pc) return
-      pc.getSenders().forEach(s => {
-        if (s.track?.kind !== 'video' || !s.getParameters) return
-        const p = s.getParameters()
-        p.encodings = [{maxBitrate: 900_000, maxFramerate: 24}]
-        s.setParameters(p).catch(() => {})
-      })
-    } catch (_) {}
-  }, 2500)
+function connectToMember(m) {
+  if (m.peerId === peer.id) return
+  members.set(m.peerId, m)
+  peerUid.set(m.peerId, m.uid)
+  identFor(m.uid, m.name)
+  if (!conns.has(m.peerId)) {
+    const conn = peer.connect(m.peerId, {reliable: true})
+    wireConn(conn)
+  }
+  callPeer(m.peerId)
 }
-function wireTransport(t) {
-  const key = pid => `${t.label}:${pid}`
-
-  t.chat.onMessage = (data) => { if (!dedupe(data.mid)) addChat(data.name || 'Guest', data.text) }
-  t.react.onMessage = (data) => {
-    if (dedupe(data.rid)) return
-    floater(data.emoji)
-    toast(`${data.name || 'Someone'} reacted ${data.emoji}`, 1600)
-  }
-  t.state.onMessage = (data, {peerId}) => {
-    if (!data.id || data.id === myId) return
-    tpeerIdent.set(key(peerId), data.id)
-    const rec = identFor(data.id, data.name)
-    applyState(rec, data)
-  }
-
-  t.room.onPeerJoin = peerId => {
-    try { t.state?.send({id: myId, name: myName, mic: micOn, cam: camOn}, {target: peerId}) } catch (_) {}
-    if (localStream) t.room.addStream(localStream, {target: peerId, metadata: meta('cam')})
-    if (screenStream) t.room.addStream(screenStream, {target: peerId, metadata: meta('screen')})
-    tuneSenders(t, peerId)
-  }
-
-  t.room.onPeerStream = (stream, peerId, metadata) => {
-    const id = metadata?.id
-    if (!id || id === myId) return
-    tpeerIdent.set(key(peerId), id)
-    const rec = identFor(id, metadata.name)
-    let src = rec.sources.get(key(peerId))
-    if (!src) { src = {}; rec.sources.set(key(peerId), src) }
-    if ((metadata.kind || 'cam') === 'screen') {
-      src.screen = stream
-      if (!rec.screenKey || screenOwnerId === id) { rec.screenKey = key(peerId); showScreen(rec, stream) }
-      stream.getVideoTracks()[0]?.addEventListener('ended', () => removeSource(rec, key(peerId)))
+function callPeer(pid) {
+  if (!localStream || calls.has(pid)) return
+  try {
+    const call = peer.call(pid, localStream, {metadata: {kind: 'cam', uid: myId, name: myName}})
+    wireCall(call)
+  } catch (_) {}
+}
+function wireCall(call) {
+  const pid = call.peer
+  const kind = call.metadata?.kind || 'cam'
+  if (kind === 'cam') calls.set(pid, call)
+  call.on('stream', stream => {
+    const m = call.metadata || {}
+    const uid = m.uid || peerUid.get(pid)
+    if (!uid) return
+    if (kind === 'screen') {
+      showScreen(uid, m.name || members.get(pid)?.name || 'Guest', stream)
+      stream.getVideoTracks()[0]?.addEventListener('ended', () => { if (screenOwnerId === uid) hideSpotlight() })
     } else {
-      src.cam = stream
-      if (!rec.camKey) { rec.camKey = key(peerId); rec.video.srcObject = stream; watchSpeaking(stream, rec.tile) }
+      peerUid.set(pid, uid)
+      const rec = identFor(uid, m.name)
+      rec.video.srcObject = stream
+      watchSpeaking(stream, rec.tile)
     }
-  }
+  })
+  call.on('close', () => {
+    if (kind === 'cam') calls.delete(pid)
+    if (kind === 'screen') {
+      const uid = call.metadata?.uid || peerUid.get(pid)
+      if (screenOwnerId === uid) hideSpotlight()
+      screenCalls.delete(pid)
+    }
+  })
+  call.on('error', () => {})
+  watchIce(call, pid)
+}
+function watchIce(call, pid) {
+  try {
+    const pc = call.peerConnection; if (!pc) return
+    pc.oniceconnectionstatechange = () => {
+      if (pc.iceConnectionState === 'failed') toast(`Connection to ${members.get(pid)?.name || 'a participant'} failed — their network may block peer-to-peer.`, 5000)
+      if (pc.iceConnectionState === 'disconnected') setTimeout(() => { if (pc.iceConnectionState === 'failed' || pc.iceConnectionState === 'disconnected') onPeerGone(pid) }, 6000)
+    }
+  } catch (_) {}
+}
 
-  t.room.onPeerLeave = peerId => {
-    const id = tpeerIdent.get(key(peerId))
-    tpeerIdent.delete(key(peerId))
-    if (!id) return
-    const rec = idents.get(id); if (!rec) return
-    removeSource(rec, key(peerId))
-    const stillConnected = [...tpeerIdent.values()].includes(id)
-    if (!stillConnected && rec.sources.size === 0) {
-      sysChat(`${rec.name} left`)
-      rec.tile.remove()
-      if (screenOwnerId === id) hideSpotlight()
-      idents.delete(id)
-      updateCount()
+function onData(fromPid, data) {
+  if (!data || typeof data !== 'object') return
+  switch (data.t) {
+    case 'hi': {
+      peerUid.set(fromPid, data.uid)
+      if (!members.has(fromPid)) members.set(fromPid, {peerId: fromPid, uid: data.uid, name: data.name})
+      identFor(data.uid, data.name)
+      break
+    }
+    case 'hello': { // guest -> host only
+      if (!amHost) break
+      const guest = {peerId: fromPid, uid: data.uid, name: data.name}
+      const existing = [{peerId: peer.id, uid: myId, name: myName}, ...members.values()]
+      members.set(fromPid, guest)
+      peerUid.set(fromPid, data.uid)
+      identFor(data.uid, data.name)
+      sendTo(fromPid, {t: 'welcome', members: existing})
+      broadcast({t: 'join', member: guest}, fromPid)
+      break
+    }
+    case 'welcome': { // host -> guest: connect to everyone already here
+      (data.members || []).forEach(m => { if (m.peerId !== peer.id) connectToMember(m) })
+      break
+    }
+    case 'join': { // someone new arrived (via host broadcast)
+      if (data.member && data.member.peerId !== peer.id) {
+        members.set(data.member.peerId, data.member)
+        peerUid.set(data.member.peerId, data.member.uid)
+        identFor(data.member.uid, data.member.name)
+        // the newcomer initiates data+media to us; nothing to dial here
+      }
+      break
+    }
+    case 'leave': {
+      const uid = data.uid || peerUid.get(data.peerId)
+      members.delete(data.peerId)
+      if (uid) removeIdent(uid, data.name)
+      break
+    }
+    case 'chat': {
+      if (dedupe(data.mid)) break
+      addChat(data.name || 'Guest', data.text)
+      break
+    }
+    case 'react': {
+      if (dedupe(data.rid)) break
+      floater(data.emoji)
+      toast(`${data.name || 'Someone'} reacted ${data.emoji}`, 1600)
+      break
+    }
+    case 'state': {
+      if (!data.uid || data.uid === myId) break
+      peerUid.set(fromPid, data.uid)
+      applyState(identFor(data.uid, data.name), data)
+      break
     }
   }
 }
 
-/* ---------------- join ---------------- */
+function onPeerGone(pid) {
+  const uid = peerUid.get(pid)
+  const wasMember = members.has(pid)
+  conns.delete(pid); calls.delete(pid); screenCalls.delete(pid)
+  peerUid.delete(pid); members.delete(pid)
+  if (uid) {
+    const stillThere = [...peerUid.values()].includes(uid)
+    if (!stillThere) removeIdent(uid)
+  }
+  if (amHost && wasMember) broadcast({t: 'leave', peerId: pid, uid, name: undefined})
+  if (pid === hostId && !amHost) tryClaimHost()
+}
+
+/* host election: if the host vanished, the earliest-joined remaining
+   member tries to take over the host id so new joiners can still find us */
+function tryClaimHost() {
+  toast('Host left — re-forming the room…')
+  let attempts = 0
+  const claim = () => {
+    attempts++
+    const p = new Peer(hostId, {config: ICE})
+    p.on('open', () => {
+      // adopt as the join-host for NEW arrivals. The old peer object is
+      // deliberately NOT destroyed — existing mesh connections live on it
+      // and keep running; both peers stay wired.
+      peer = p
+      amHost = true
+      wirePeerBasics()
+      toast('You are the new room host')
+    })
+    p.on('error', e => {
+      try { p.destroy() } catch (_) {}
+      if (e.type === 'unavailable-id' && attempts < 6) setTimeout(claim, 2500)
+    })
+  }
+  setTimeout(claim, 1500 + Math.random() * 1500)
+}
+
+/* ---------------- peer setup ---------------- */
+function wirePeerBasics() {
+  peer.on('connection', conn => {
+    wireConn(conn)
+    if (amHost) { /* hello handled in onData */ }
+  })
+  peer.on('call', call => {
+    const kind = call.metadata?.kind || 'cam'
+    if (call.metadata?.uid) peerUid.set(call.peer, call.metadata.uid)
+    if (kind === 'screen') {
+      call.answer() // receive-only for shares
+      screenCalls.set(call.peer, call)
+    } else {
+      call.answer(localStream || undefined)
+    }
+    wireCall(call)
+  })
+  peer.on('disconnected', () => { try { peer.reconnect() } catch (_) {} })
+  peer.on('error', e => {
+    if (e.type === 'network' || e.type === 'server-error') toast('Signaling connection hiccup — retrying…', 3000)
+  })
+}
+
 async function join() {
   myName = els.name.value.trim() || 'Guest'
   roomName = sanitizeRoom(els.room.value) || randomRoom()
+  hostId = HOST_PREFIX + roomName
   try { localStorage.setItem('goatmeet-name', myName) } catch (_) {}
   if (!localStream) await startPreview()
 
@@ -299,48 +410,47 @@ async function join() {
   els.conn.textContent = 'connecting…'
   history.replaceState(null, '', '?room=' + encodeURIComponent(roomName))
 
-  // my own tile
-  const mine = makeTile(myName + ' (you)')
-  mine.tile.classList.add('self')
+  const mine = makeTile(myName + ' (you)', true)
   if (localStream) { mine.video.srcObject = localStream; watchSpeaking(localStream, mine.tile) }
   mine.mic.classList.toggle('hidden', micOn)
   syncCallButtons()
+  joinedAt = Date.now()
 
-  let engine
   try {
-    engine = await import(/* @vite-ignore */ENGINE_URL)
+    ;({Peer} = await import(/* @vite-ignore */ENGINE_URL))
   } catch (e) {
     els.conn.textContent = 'could not load the meeting engine — refresh and try again'
     return
   }
 
-  const cfgs = [
-    ['nostr', () => engine.joinRoomNostr({appId: APP_ID, rtcConfig: ICE, relayConfig: {urls: RELAYS}}, roomName)],
-    ['torrent', () => engine.joinRoomTorrent({appId: APP_ID, rtcConfig: ICE}, roomName)]
-  ]
-  for (const [label, make] of cfgs) {
-    try {
-      const roomT = make()
-      const t = {label, room: roomT, chat: roomT.makeAction('chat'), react: roomT.makeAction('react'), state: roomT.makeAction('state')}
-      transports.push(t)
-      wireTransport(t)
-      if (localStream) roomT.addStream(localStream, {metadata: meta('cam')})
-    } catch (e) { console.warn(label, 'transport failed', e) }
-  }
-  if (!transports.length) { els.conn.textContent = 'no discovery network could start — refresh'; return }
-
-  setInterval(() => {
-    try {
-      const socks = engine.getRelaySockets ? Object.values(engine.getRelaySockets()) : []
-      relayOpen = socks.filter(s => s.readyState === 1).length
-    } catch (_) {}
-    if (idents.size === 0) {
-      els.conn.textContent = `waiting for others · relays ${relayOpen}/${RELAYS.length} + torrent · share the link`
-    }
-  }, 3000)
-  setTimeout(() => { if (relayOpen === 0 && idents.size === 0) toast('Still no relays after 25s — this network may block them. Try another network if nobody can join.', 7000) }, 25000)
+  // Try to be the host; if the id is taken, join as guest.
+  peer = new Peer(hostId, {config: ICE})
+  peer.on('open', id => {
+    amHost = true
+    els.conn.textContent = 'just you here — share the link to invite your team'
+    wirePeerBasics()
+    sysChat('You created room "' + roomName + '"')
+  })
+  peer.on('error', e => {
+    if (e.type !== 'unavailable-id') { toast('Connection error: ' + e.type, 4000); return }
+    // guest path
+    try { peer.destroy() } catch (_) {}
+    peer = new Peer({config: ICE})
+    peer.on('open', () => {
+      amHost = false
+      wirePeerBasics()
+      const conn = peer.connect(hostId, {reliable: true})
+      wireConn(conn)
+      const helloTimer = setInterval(() => {
+        if (conn.open) { conn.send({t: 'hello', uid: myId, name: myName}); clearInterval(helloTimer) }
+      }, 400)
+      setTimeout(() => clearInterval(helloTimer), 15000)
+      els.conn.textContent = 'joining room…'
+      sysChat('You joined room "' + roomName + '"')
+    })
+    peer.on('error', e2 => { if (e2.type !== 'unavailable-id') toast('Connection error: ' + e2.type, 4000) })
+  })
   updateCount()
-  sysChat('You joined room "' + roomName + '"')
 }
 
 /* ---------------- controls ---------------- */
@@ -350,7 +460,6 @@ function syncCallButtons() {
   els.btnCam.classList.toggle('off', !camOn)
   els.btnCam.innerHTML = (camOn ? '📷' : '🚫') + '<span>Camera</span>'
 }
-function broadcastState() { sendAll('state', {id: myId, name: myName, mic: micOn, cam: camOn}) }
 els.btnMic.addEventListener('click', toggleMic)
 els.btnCam.addEventListener('click', toggleCam)
 function toggleMic() {
@@ -376,13 +485,20 @@ els.btnShare.addEventListener('click', async () => {
   els.spotlightLabel.textContent = '🖥️ You are sharing your screen'
   els.spotlight.classList.remove('hidden')
   els.btnShare.classList.add('active')
-  transports.forEach(t => t.room.addStream(screenStream, {metadata: meta('screen')}))
+  members.forEach((m, pid) => {
+    try {
+      const call = peer.call(pid, screenStream, {metadata: {kind: 'screen', uid: myId, name: myName}})
+      screenCalls.set(pid, call)
+      wireCall(call)
+    } catch (_) {}
+  })
   screenStream.getVideoTracks()[0].addEventListener('ended', stopShare)
   toast('Sharing screen' + (screenStream.getAudioTracks().length ? ' with audio' : ''))
 })
 function stopShare() {
   if (!screenStream) return
-  transports.forEach(t => { try { t.room.removeStream(screenStream, {metadata: meta('screen')}) } catch (_) {} })
+  screenCalls.forEach(c => { try { c.close() } catch (_) {} })
+  screenCalls.clear()
   screenStream.getTracks().forEach(t => t.stop())
   screenStream = null
   els.btnShare.classList.remove('active')
@@ -397,7 +513,9 @@ $('#copy-btn').addEventListener('click', async () => {
 $('#btn-react').addEventListener('click', () => $('#react-menu').classList.toggle('hidden'))
 document.querySelectorAll('#react-menu button').forEach(b => b.addEventListener('click', () => {
   const emoji = b.dataset.emoji
-  sendAll('react', {rid: myId + '-' + (++msgSeq) + '-' + Date.now(), emoji, name: myName})
+  const payload = {t: 'react', rid: myId + '-' + (++msgSeq) + '-' + Date.now(), emoji, name: myName}
+  dedupe(payload.rid)
+  broadcast(payload)
   floater(emoji)
   $('#react-menu').classList.add('hidden')
 }))
@@ -411,14 +529,15 @@ $('#chat-form').addEventListener('submit', e => {
   e.preventDefault()
   const text = $('#chat-input').value.trim(); if (!text) return
   $('#chat-input').value = ''
-  const payload = {mid: myId + '-' + (++msgSeq) + '-' + Date.now(), name: myName, text}
+  const payload = {t: 'chat', mid: myId + '-' + (++msgSeq) + '-' + Date.now(), name: myName, text}
   dedupe(payload.mid)
-  sendAll('chat', payload)
+  broadcast(payload)
   addChat(myName, text, true)
 })
 
 $('#btn-leave').addEventListener('click', () => {
-  transports.forEach(t => { try { t.room.leave() } catch (_) {} })
+  broadcast({t: 'leave', peerId: peer?.id, uid: myId, name: myName})
+  try { peer?.destroy() } catch (_) {}
   localStream?.getTracks().forEach(t => t.stop())
   screenStream?.getTracks().forEach(t => t.stop())
   location.href = location.pathname + '?room=' + encodeURIComponent(roomName)
