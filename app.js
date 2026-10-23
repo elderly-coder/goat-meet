@@ -1,9 +1,9 @@
-// GOAT Meet — serverless P2P meetings, build v1.3 (PeerJS mesh)
+// GOAT Meet — serverless P2P meetings, build v1.5 (PeerJS mesh)
 // Signaling: PeerJS Cloud introduces peers (host pattern). Media and data
 // then flow directly browser-to-browser (DTLS-SRTP encrypted). No meeting
 // server ever sees the call.
-const BUILD = 'v1.4'
-const ENGINE_URL = './peerjs.bundle.mjs?v=14'
+const BUILD = 'v1.5'
+const ENGINE_URL = './peerjs.bundle.mjs?v=15'
 const HOST_PREFIX = 'goatmeet-v3-'
 const ICE = {
   iceServers: [
@@ -598,8 +598,26 @@ document.addEventListener('keydown', e => {
 })
 
 /* ---------------- init ---------------- */
+async function selfUpdateCheck() {
+  // GitHub Pages + browser caches can pin a device to an old build.
+  // version.json is fetched no-store; if it names a newer build, reload
+  // once under a fresh URL (different cache key) preserving the room.
+  try {
+    if (sessionStorage.getItem('gm-updated') === BUILD) return
+    const r = await fetch('version.json?ts=' + Date.now(), {cache: 'no-store'})
+    if (!r.ok) return
+    const j = await r.json()
+    if (j && j.build && j.build !== BUILD) {
+      sessionStorage.setItem('gm-updated', j.build)
+      const q = new URLSearchParams(location.search)
+      const room = q.get('room')
+      location.replace(location.pathname + '?fresh=' + Date.now() + (room ? '&room=' + encodeURIComponent(room) : ''))
+    }
+  } catch (_) {}
+}
 {
   const tag = $('#build-tag'); if (tag) tag.textContent = 'build ' + BUILD + ' · no servers · no tracking'
+  selfUpdateCheck()
   const q = new URLSearchParams(location.search)
   const roomParam = q.get('room') || (location.hash || '').replace('#', '')
   if (roomParam) els.room.value = sanitizeRoom(roomParam)
