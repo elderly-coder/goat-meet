@@ -2,8 +2,8 @@
 // Signaling: PeerJS Cloud introduces peers (host pattern). Media and data
 // then flow directly browser-to-browser (DTLS-SRTP encrypted). No meeting
 // server ever sees the call.
-const BUILD = 'v1.3'
-const ENGINE_URL = './peerjs.bundle.mjs?v=13'
+const BUILD = 'v1.4'
+const ENGINE_URL = './peerjs.bundle.mjs?v=14'
 const HOST_PREFIX = 'goatmeet-v3-'
 const ICE = {
   iceServers: [
@@ -51,6 +51,39 @@ function toast(msg, ms = 2600) {
   els.toast.classList.remove('hidden')
   clearTimeout(toast._t)
   toast._t = setTimeout(() => els.toast.classList.add('hidden'), ms)
+}
+function dlog(msg) {
+  const t = new Date().toTimeString().slice(0, 8)
+  try {
+    const box = document.querySelector('#diag-log')
+    if (box) {
+      const line = document.createElement('div')
+      line.textContent = t + '  ' + msg
+      box.appendChild(line)
+      box.scrollTop = box.scrollHeight
+      while (box.children.length > 60) box.firstChild.remove()
+    }
+  } catch (_) {}
+  try { console.log('[gm]', msg) } catch (_) {}
+}
+function iceProbe() {
+  // Self-test: what network paths can THIS device offer? Logged in the diag panel.
+  try {
+    const pc = new RTCPeerConnection(ICE)
+    const tally = {host: 0, srflx: 0, relay: 0, other: 0}
+    pc.onicecandidate = e => {
+      if (!e.candidate) {
+        dlog('network probe: candidates host=' + tally.host + ' srflx=' + tally.srflx + ' relay(TURN)=' + tally.relay + (tally.host + tally.srflx + tally.relay === 0 ? ' — NO usable network path from this device/browser' : ''))
+        try { pc.close() } catch (_) {}
+        return
+      }
+      const ty = e.candidate.type || 'other'
+      if (ty in tally) tally[ty]++; else tally.other++
+    }
+    pc.createDataChannel('probe')
+    pc.createOffer().then(o => pc.setLocalDescription(o)).catch(() => {})
+    setTimeout(() => { try { pc.close() } catch (_) {} }, 8000)
+  } catch (e) { dlog('network probe failed: ' + e.name) }
 }
 function sanitizeRoom(r) {
   return (r || '').toLowerCase().trim().replace(/[^a-z0-9-_]+/g, '-').replace(/^-+|-+$/g, '').slice(0, 60)
@@ -209,6 +242,7 @@ function wireConn(conn) {
   conns.set(pid, conn)
   conn.on('open', () => {
     conns.set(pid, conn)
+    dlog('data link OPEN with ' + (pid === hostId ? 'the host' : pid))
     conn.send({t: 'hi', uid: myId, name: myName})
     conn.send({t: 'state', uid: myId, name: myName, mic: micOn, cam: camOn})
     if (amHost) {
@@ -243,6 +277,7 @@ function wireCall(call) {
   const kind = call.metadata?.kind || 'cam'
   if (kind === 'cam') calls.set(pid, call)
   call.on('stream', stream => {
+    dlog('media received from ' + (call.metadata?.name || pid))
     const m = call.metadata || {}
     const uid = m.uid || peerUid.get(pid)
     if (!uid) return
@@ -270,7 +305,13 @@ function wireCall(call) {
 function watchIce(call, pid) {
   try {
     const pc = call.peerConnection; if (!pc) return
+    const tally = {host: 0, srflx: 0, relay: 0}
+    pc.onicecandidate = e => {
+      if (e.candidate && e.candidate.type in tally) tally[e.candidate.type]++
+      if (!e.candidate) dlog('call candidates (' + (members.get(pid)?.name || pid) + '): host=' + tally.host + ' srflx=' + tally.srflx + ' relay=' + tally.relay)
+    }
     pc.oniceconnectionstatechange = () => {
+      dlog('call link state (' + (members.get(pid)?.name || pid) + '): ' + pc.iceConnectionState)
       if (pc.iceConnectionState === 'failed') toast(`Connection to ${members.get(pid)?.name || 'a participant'} failed — their network may block peer-to-peer.`, 5000)
       if (pc.iceConnectionState === 'disconnected') setTimeout(() => { if (pc.iceConnectionState === 'failed' || pc.iceConnectionState === 'disconnected') onPeerGone(pid) }, 6000)
     }
@@ -287,6 +328,7 @@ function onData(fromPid, data) {
       break
     }
     case 'hello': { // guest -> host only
+      dlog('guest said hello: ' + (data.name || data.uid))
       if (!amHost) break
       const guest = {peerId: fromPid, uid: data.uid, name: data.name}
       const existing = [{peerId: peer.id, uid: myId, name: myName}, ...members.values()]
@@ -298,7 +340,8 @@ function onData(fromPid, data) {
       break
     }
     case 'welcome': { // host -> guest: connect to everyone already here
-      (data.members || []).forEach(m => { if (m.peerId !== peer.id) connectToMember(m) })
+      dlog('host welcomed us; ' + ((data.members || []).length) + ' participant(s) listed')
+      ;(data.members || []).forEach(m => { if (m.peerId !== peer.id) connectToMember(m) })
       break
     }
     case 'join': { // someone new arrived (via host broadcast)
@@ -424,9 +467,12 @@ async function join() {
   }
 
   // Try to be the host; if the id is taken, join as guest.
+  dlog('joining room "' + roomName + '" as ' + myName)
+  iceProbe()
   peer = new Peer(hostId, {config: ICE})
   peer.on('open', id => {
     amHost = true
+    dlog('you are the HOST (first in room). Waiting for others to join this exact room name.')
     els.conn.textContent = 'just you here — share the link to invite your team'
     wirePeerBasics()
     sysChat('You created room "' + roomName + '"')
@@ -438,6 +484,7 @@ async function join() {
     peer = new Peer({config: ICE})
     peer.on('open', () => {
       amHost = false
+      dlog('you joined as GUEST — a host already holds this room. Connecting to host…')
       wirePeerBasics()
       const conn = peer.connect(hostId, {reliable: true})
       wireConn(conn)

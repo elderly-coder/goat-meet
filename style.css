@@ -87,3 +87,8 @@ input{font-family:inherit}
   .grid{grid-template-columns:repeat(auto-fit,minmax(128px,1fr))}
   .spotlight{flex-basis:44%}
 }
+
+/* diagnostics panel */
+.diag{position:fixed;left:10px;bottom:86px;z-index:40;max-width:min(92vw,520px);background:rgba(10,13,20,.92);border:1px solid #2a3247;border-radius:10px;color:#9fb0cc;font-size:12px}
+.diag summary{cursor:pointer;padding:6px 10px;user-select:none}
+.diag-log{max-height:180px;overflow:auto;padding:0 10px 8px;font-family:ui-monospace,Menlo,monospace;white-space:pre-wrap;word-break:break-word;line-height:1.5}
